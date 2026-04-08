@@ -20,6 +20,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 
 class Config:
