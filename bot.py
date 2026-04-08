@@ -19,8 +19,14 @@ You will receive three data inputs at runtime:
   [1] PORTFOLIO_DATA   — JSON array: ticker, quantity, averagePrice,
       currentPrice, unrealizedPnL, unrealizedPnLPct
   [2] MARKET_NEWS      — Today's top US equity headlines
-  [3] PENDING_ORDERS   — JSON array: ticker, type, action, quantity,
-      limitPrice, stopPrice, status
+  [3] PENDING_ORDERS   — JSON array of detected pending orders:
+      - Sell orders: inferred from locked positions (quantity locked
+        for trading). Fields: ticker, action=SELL, quantity (locked amount),
+        note with full/available/locked breakdown.
+      - Buy orders: detected via blocked cash in account. Fields:
+        ticker=CASH_RESERVED, action=BUY, blockedCash (EUR amount reserved).
+      - If the direct API is available: ticker, type, action, quantity,
+        limitPrice, stopPrice, status.
 
 YOUR TASK
 1. Cross-reference each holding against today's news
@@ -68,6 +74,14 @@ Output EXACTLY this structure and nothing else:
 
 ✅ *Clean Positions*
 [comma-separated tickers with no news impact today]
+
+⏳ *Pending Orders*
+[For each locked sell order:]
+`[TICKER]` — SELL [qty] shares locked
+• Assessment: [one line on whether the limit is well-placed vs. key levels]
+
+[If blocked cash exists:]
+💰 €[amount] reserved for pending BUY limit orders
 
 ⚠️ _AI-generated analysis. Not financial advice. Always DYOR._
 
@@ -173,7 +187,12 @@ def safe_pnl_pct(current: float, average: float) -> float:
     return round(((current - average) / average) * 100, 2)
 
 
-def get_portfolio() -> list[dict]:
+def get_portfolio() -> tuple[list[dict], list[dict]]:
+    """Fetch positions and return (portfolio, raw_positions).
+
+    raw_positions contains the unprocessed API response so that
+    get_orders_from_positions() can detect locked quantities later.
+    """
     url = "https://live.trading212.com/api/v0/equity/positions"
     headers = {"Authorization": build_t212_auth_header()}
 
@@ -225,10 +244,79 @@ def get_portfolio() -> list[dict]:
         )
 
     log.info("Loaded %s positions from Trading212.", len(positions))
-    return positions
+    return positions, payload
 
 
-def get_orders() -> list[dict]:
+def get_account_cash() -> dict:
+    """Fetch account cash summary (free, blocked, total, etc.)."""
+    url = "https://live.trading212.com/api/v0/equity/account/cash"
+    headers = {"Authorization": build_t212_auth_header()}
+
+    def _fetch():
+        response = None
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            return response
+        finally:
+            time.sleep(1)
+
+    response = retry(_fetch)
+
+    if response.status_code != 200:
+        log.warning("Trading212 account/cash request failed with status %s", response.status_code)
+        return {}
+
+    data = response.json()
+    log.info("Account cash: free=%.2f, blocked=%.2f, total=%.2f",
+             safe_float(data.get("free")), safe_float(data.get("blocked")),
+             safe_float(data.get("total")))
+    return data
+
+
+def get_orders_from_positions(raw_positions: list[dict]) -> list[dict]:
+    """Infer pending SELL orders from positions where quantity is locked.
+
+    When quantityAvailableForTrading < quantity, the locked portion
+    indicates an active sell limit/stop order on that stock.
+    """
+    orders = []
+    for item in raw_positions:
+        instrument = item.get("instrument") or {}
+        raw_ticker = instrument.get("ticker", "UNKNOWN")
+        qty = safe_float(item.get("quantity"))
+        available = safe_float(item.get("quantityAvailableForTrading"))
+        locked = round(qty - available, 8)
+
+        if locked > 0.0001:
+            orders.append(
+                {
+                    "ticker": normalize_ticker(raw_ticker),
+                    "type": "LIMIT (inferred)",
+                    "action": "SELL",
+                    "quantity": locked,
+                    "limitPrice": None,
+                    "stopPrice": None,
+                    "status": "PENDING (locked)",
+                    "note": f"Full qty={qty}, available={available}, locked={locked}",
+                }
+            )
+            log.info(
+                "Inferred pending sell order: %s locked=%.4f / total=%.4f",
+                normalize_ticker(raw_ticker), locked, qty,
+            )
+
+    return orders
+
+
+def get_orders(raw_positions=None) -> list[dict]:
+    """Fetch pending orders from Trading212.
+
+    Strategy:
+    1. Try the /equity/orders endpoint first (direct API).
+    2. If 403 (insufficient permissions), fall back to inferring
+       pending sell orders from locked position quantities and
+       reporting blocked cash for pending buy orders.
+    """
     url = "https://live.trading212.com/api/v0/equity/orders"
     headers = {"Authorization": build_t212_auth_header()}
 
@@ -252,29 +340,63 @@ def get_orders() -> list[dict]:
         log.warning("T212 rate limit hit (429) for orders. Backed off...")
         raise RuntimeError("Trading212 rate limit hit (429)")
 
-    if response.status_code != 200:
-        log.warning("Trading212 orders request failed with status %s", response.status_code)
-        return []
+    # ── Direct API succeeded ──
+    if response.status_code == 200:
+        payload = response.json()
+        orders = []
+        for item in payload:
+            if item.get("status") in ["FILLED", "CANCELLED"]:
+                continue
+            orders.append(
+                {
+                    "ticker": normalize_ticker(item.get("ticker", "UNKNOWN")),
+                    "type": item.get("type"),
+                    "action": item.get("side") or item.get("action"),
+                    "quantity": safe_float(item.get("quantity")),
+                    "limitPrice": safe_float(item.get("limitPrice")),
+                    "stopPrice": safe_float(item.get("stopPrice")),
+                    "status": item.get("status"),
+                }
+            )
+        log.info("Loaded %s pending orders from Trading212 (direct API).", len(orders))
+        return orders
 
-    payload = response.json()
+    # ── Fallback: infer from positions + account cash ──
+    log.warning(
+        "Trading212 /equity/orders returned %s. "
+        "Falling back to position-lock inference for pending orders.",
+        response.status_code,
+    )
+
     orders = []
 
-    for item in payload:
-        if item.get("status") in ["FILLED", "CANCELLED"]:
-            continue
+    # Infer sell orders from locked positions
+    if raw_positions:
+        orders.extend(get_orders_from_positions(raw_positions))
+
+    # Get account cash to report blocked amount (pending buy orders)
+    cash = get_account_cash()
+    blocked = safe_float(cash.get("blocked"))
+    if blocked > 0:
         orders.append(
             {
-                "ticker": normalize_ticker(item.get("ticker", "UNKNOWN")),
-                "type": item.get("type"),
-                "action": item.get("action"),
-                "quantity": safe_float(item.get("quantity")),
-                "limitPrice": safe_float(item.get("limitPrice")),
-                "stopPrice": safe_float(item.get("stopPrice")),
-                "status": item.get("status"),
+                "ticker": "CASH_RESERVED",
+                "type": "BUY LIMIT (inferred)",
+                "action": "BUY",
+                "quantity": None,
+                "limitPrice": None,
+                "stopPrice": None,
+                "status": "PENDING",
+                "blockedCash": blocked,
+                "note": f"€{blocked:.2f} reserved for pending buy limit orders",
             }
         )
+        log.info("Detected €%.2f blocked cash for pending buy orders.", blocked)
 
-    log.info("Loaded %s pending orders from Trading212.", len(orders))
+    log.info(
+        "Inferred %s pending order entries from position locks + blocked cash.",
+        len(orders),
+    )
     return orders
 
 
@@ -430,8 +552,8 @@ def main():
     log.info("Starting AI Broker Bot — action=%s", ACTION_TYPE)
 
     try:
-        portfolio = get_portfolio()
-        orders = get_orders()
+        portfolio, raw_positions = get_portfolio()
+        orders = get_orders(raw_positions=raw_positions)
     except Exception as e:
         send_telegram(f"⚠️ *Trading212 fetch failed*\n`{e}`")
         return
