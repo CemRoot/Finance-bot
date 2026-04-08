@@ -329,6 +329,8 @@ def send_telegram(text: str, parse_mode: str = "Markdown") -> None:
         log.warning("Telegram parse_mode error, retrying without parse_mode: %s", response.text)
         body_no_parse = {"chat_id": CHAT_ID, "text": text}
         response = requests.post(url, json=body_no_parse, timeout=10)
+        if response.status_code >= 400:
+            log.error("Telegram fallback send failed with status %s: %s", response.status_code, response.text)
 
     response.raise_for_status()
     log.info("Telegram message sent (%s chars).", len(text))
@@ -337,7 +339,24 @@ def send_telegram(text: str, parse_mode: str = "Markdown") -> None:
 def send_telegram_chunked_json(data: list) -> None:
     json_str = json.dumps(data, indent=2, ensure_ascii=False)
     max_chunk = 3700
-    chunks = [json_str[i : i + max_chunk] for i in range(0, len(json_str), max_chunk)] or [""]
+    chunks = []
+    current_chunk = ""
+    for line in json_str.splitlines(keepends=True):
+        if len(current_chunk) + len(line) <= max_chunk:
+            current_chunk += line
+            continue
+        if current_chunk:
+            chunks.append(current_chunk)
+        if len(line) <= max_chunk:
+            current_chunk = line
+            continue
+        for i in range(0, len(line), max_chunk):
+            chunks.append(line[i : i + max_chunk])
+        current_chunk = ""
+    if current_chunk:
+        chunks.append(current_chunk)
+    if not chunks:
+        chunks = [""]
 
     for chunk in chunks:
         send_telegram(f"```json\n{chunk}\n```")
