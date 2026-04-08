@@ -229,10 +229,14 @@ def get_market_news() -> str:
     if not finnhub_key:
         return "No live news available. Perform general market analysis only."
 
-    url = f"https://finnhub.io/api/v1/news?category=general&token={finnhub_key}"
+    url = "https://finnhub.io/api/v1/news"
 
     def _fetch():
-        return requests.get(url, timeout=10)
+        return requests.get(
+            url,
+            params={"category": "general", "token": finnhub_key},
+            timeout=10,
+        )
 
     response = retry(_fetch)
     response.raise_for_status()
