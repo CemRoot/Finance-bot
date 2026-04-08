@@ -1,0 +1,46 @@
+name: AI Broker Bot
+on:
+  schedule:
+    - cron: '45 13 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      action_type:
+        description: 'Action'
+        required: true
+        default: 'analiz'
+        type: choice
+        options:
+          - analiz
+          - portfoy_json
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Mask secrets in logs
+        run: |
+          echo "::add-mask::${{ secrets.TELEGRAM_TOKEN }}"
+          echo "::add-mask::${{ secrets.TELEGRAM_CHAT_ID }}"
+          echo "::add-mask::${{ secrets.TRADING212_API_KEY }}"
+          echo "::add-mask::${{ secrets.TRADING212_API_SECRET }}"
+          echo "::add-mask::${{ secrets.GEMINI_API_KEY }}"
+          echo "::add-mask::${{ secrets.FINNHUB_KEY }}"
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN:        ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          TRADING212_API_KEY:    ${{ secrets.TRADING212_API_KEY }}
+          TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          FINNHUB_KEY:           ${{ secrets.FINNHUB_KEY }}
+          ACTION_TYPE:           ${{ github.event.inputs.action_type || 'analiz' }}
+        run: python bot.py
