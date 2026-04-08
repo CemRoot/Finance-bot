@@ -6,12 +6,290 @@ import logging
 import base64
 from datetime import date
 from zoneinfo import ZoneInfo
+from typing import Tuple, List, Dict, Any, Optional
+
 import requests
 import yfinance as yf
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """You are a professional Wall Street equity analyst and personal portfolio manager
+class Config:
+    """Handles environment variables and configuration."""
+
+    def __init__(self):
+        self.telegram_token = os.environ.get("TELEGRAM_TOKEN")
+        self.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        self.t212_key = os.environ.get("TRADING212_API_KEY")
+        self.t212_secret = os.environ.get("TRADING212_API_SECRET")
+        self.gemini_key = os.environ.get("GEMINI_API_KEY")
+        self.finnhub_key = os.environ.get("FINNHUB_KEY")
+        self.action_type = os.environ.get("ACTION_TYPE", "analiz")
+        self.timezone = ZoneInfo("America/New_York")
+
+    def validate(self):
+        required = {
+            "TELEGRAM_TOKEN": self.telegram_token,
+            "TELEGRAM_CHAT_ID": self.telegram_chat_id,
+            "TRADING212_API_KEY": self.t212_key,
+            "TRADING212_API_SECRET": self.t212_secret,
+            "GEMINI_API_KEY": self.gemini_key,
+        }
+        for name, val in required.items():
+            if not val:
+                log.error(f"Missing required environment variable: {name}")
+                sys.exit(1)
+        if not self.finnhub_key:
+            log.warning("Optional environment variable FINNHUB_KEY is missing. Live news will be disabled.")
+
+
+def retry(fn, retries=3, backoff=2.0):
+    """Utility to retry API calls with exponential backoff."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retries:
+                log.error(f"Attempt {attempt}/{retries} failed. No retries left.")
+                raise
+            wait_seconds = backoff ** attempt
+            log.warning(f"Attempt {attempt}/{retries} failed: {exc}. Retrying in {wait_seconds:.2f}s.")
+            time.sleep(wait_seconds)
+    raise last_error
+
+
+class Utils:
+    """Common parsing and formatting utilities."""
+    @staticmethod
+    def normalize_ticker(raw: str) -> str:
+        return raw.split("_")[0] if "_" in raw else raw
+
+    @staticmethod
+    def safe_float(value: Any, fallback: float = 0.0) -> float:
+        if value is None:
+            return fallback
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return fallback
+
+    @staticmethod
+    def safe_pnl_pct(current: float, average: float) -> float:
+        if not average:
+            return 0.0
+        return round(((current - average) / average) * 100, 2)
+
+
+class Trading212Client:
+    """Client for Trading212 unofficial API integrations."""
+    BASE_URL = "https://live.trading212.com/api/v0"
+
+    def __init__(self, key: str, secret: str):
+        self.key = key
+        self.secret = secret
+
+    def _get_auth_header(self) -> str:
+        encoded = base64.b64encode(f"{self.key}:{self.secret}".encode("utf-8")).decode("utf-8")
+        return f"Basic {encoded}"
+
+    def _request(self, endpoint: str) -> requests.Response:
+        url = f"{self.BASE_URL}/{endpoint}"
+        headers = {"Authorization": self._get_auth_header()}
+
+        def _fetch():
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 401:
+                log.error(f"T212 auth failed for {endpoint}. Check API keys.")
+                raise RuntimeError("Trading212 authentication failed (401)")
+            if res.status_code == 429:
+                log.warning("T212 rate limit hit (429). Exceeded 1 req/s.")
+                raise RuntimeError("Trading212 rate limit hit (429)")
+            return res
+
+        response = retry(_fetch)
+        time.sleep(1)  # Rate limit protection
+        return response
+
+    def get_portfolio(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Returns structured positions, and raw API positions for inference."""
+        res = self._request("equity/positions")
+        if res.status_code != 200:
+            log.error(f"T212 positions request failed: {res.status_code}")
+            raise RuntimeError(f"Positions failed: {res.status_code}")
+        
+        raw_positions = res.json()
+        positions = []
+        for item in raw_positions:
+            instrument = item.get("instrument", {})
+            raw_ticker = instrument.get("ticker", "UNKNOWN")
+            avg = Utils.safe_float(item.get("averagePricePaid"))
+            current = Utils.safe_float(item.get("currentPrice"))
+            qty = Utils.safe_float(item.get("quantity"))
+            wallet = item.get("walletImpact", {})
+            pnl = Utils.safe_float(wallet.get("unrealizedProfitLoss"))
+
+            positions.append({
+                "ticker": Utils.normalize_ticker(raw_ticker),
+                "quantity": qty,
+                "averagePrice": avg,
+                "currentPrice": current,
+                "unrealizedPnL": pnl,
+                "unrealizedPnLPct": Utils.safe_pnl_pct(current, avg),
+            })
+        
+        log.info(f"Loaded {len(positions)} positions from Trading212.")
+        return positions, raw_positions
+
+    def get_account_cash(self) -> Dict[str, Any]:
+        """Fetch account cash summary."""
+        res = self._request("equity/account/cash")
+        if res.status_code == 200:
+            return res.json()
+        log.warning(f"T212 account/cash request failed: {res.status_code}")
+        return {}
+
+    def get_orders(self, raw_positions: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """Fetch pending orders, falling back to inference if 403."""
+        try:
+            res = self._request("equity/orders")
+            if res.status_code == 200:
+                orders = []
+                for item in res.json():
+                    if item.get("status") in ["FILLED", "CANCELLED"]:
+                        continue
+                    orders.append({
+                        "ticker": Utils.normalize_ticker(item.get("ticker", "UNKNOWN")),
+                        "type": item.get("type"),
+                        "action": item.get("side", item.get("action")),
+                        "quantity": Utils.safe_float(item.get("quantity")),
+                        "limitPrice": Utils.safe_float(item.get("limitPrice")),
+                        "stopPrice": Utils.safe_float(item.get("stopPrice")),
+                        "status": item.get("status"),
+                    })
+                log.info(f"Loaded {len(orders)} pending orders directly.")
+                return orders
+            log.warning(f"/equity/orders returned {res.status_code}. Using inference fallback.")
+        except RuntimeError as e:
+            if "401" in str(e):
+                raise  # Hard fail on auth
+            log.warning("Orders request errored. Falling back to inference.")
+
+        # --- Inference Fallback ---
+        orders = []
+        if raw_positions:
+            for item in raw_positions:
+                instrument = item.get("instrument", {})
+                raw_ticker = instrument.get("ticker", "UNKNOWN")
+                qty = Utils.safe_float(item.get("quantity"))
+                available = Utils.safe_float(item.get("quantityAvailableForTrading"))
+                locked = round(qty - available, 8)
+
+                if locked > 0.0001:
+                    ticker = Utils.normalize_ticker(raw_ticker)
+                    orders.append({
+                        "ticker": ticker,
+                        "type": "LIMIT (inferred)",
+                        "action": "SELL",
+                        "quantity": locked,
+                        "limitPrice": None,
+                        "stopPrice": None,
+                        "status": "PENDING (locked)",
+                        "note": f"Full qty={qty}, available={available}, locked={locked}",
+                    })
+                    log.info(f"Inferred pending sell: {ticker} (locked {locked})")
+
+        cash = self.get_account_cash()
+        blocked = Utils.safe_float(cash.get("blocked"))
+        if blocked > 0:
+            orders.append({
+                "ticker": "CASH_RESERVED",
+                "type": "BUY LIMIT (inferred)",
+                "action": "BUY",
+                "quantity": None,
+                "limitPrice": None,
+                "stopPrice": None,
+                "status": "PENDING",
+                "blockedCash": blocked,
+                "note": f"€{blocked:.2f} reserved for pending buy limit orders",
+            })
+            log.info(f"Detected €{blocked:.2f} reserved cash for buy orders.")
+
+        log.info(f"Inferred {len(orders)} pending orders total.")
+        return orders
+
+
+class MarketDataClient:
+    """Handles external news and technicals integration."""
+    def __init__(self, finnhub_key: Optional[str]):
+        self.finnhub_key = finnhub_key
+
+    def get_news(self) -> str:
+        if not self.finnhub_key:
+            return "No live news available. Perform general market analysis only."
+        
+        def _fetch():
+            res = requests.get(
+                "https://finnhub.io/api/v1/news",
+                params={"category": "general", "token": self.finnhub_key},
+                timeout=10,
+            )
+            res.raise_for_status()
+            return res
+        
+        try:
+            res = retry(_fetch)
+            headlines = [item.get("headline", "").strip() for item in res.json() if item.get("headline", "").strip()]
+            headlines = headlines[:15]
+            log.info(f"Collected {len(headlines)} market headlines from Finnhub.")
+            return "\n".join(f"- {h}" for h in headlines)
+        except Exception as e:
+            log.warning(f"Finnhub news fetch failed: {e}")
+            return "News unavailable today."
+
+    def get_technicals(self, ticker: str) -> Dict[str, Any]:
+        if not ticker or ticker == "CASH_RESERVED":
+            return {}
+
+        try:
+            # Silence massive yfinance logger spam
+            tkr = yf.Ticker(ticker)
+            hist = tkr.history(period="3mo", auto_adjust=False)
+            if hist.empty:
+                log.info(f"{ticker}: No moving average data (history is empty).")
+                return {}
+
+            support_series = hist["Low"].rolling(20).min().dropna()
+            resistance_series = hist["High"].rolling(20).max().dropna()
+
+            support = round(float(support_series.iloc[-1]), 2) if not support_series.empty else None
+            resistance = round(float(resistance_series.iloc[-1]), 2) if not resistance_series.empty else None
+
+            vol_trend = "normal"
+            vol_series = hist["Volume"].dropna()
+            if not vol_series.empty:
+                avg_vol = vol_series.mean()
+                if vol_series.iloc[-1] < avg_vol * 0.7:
+                    vol_trend = "declining"
+
+            return {"support": support, "resistance": resistance, "volume_trend": vol_trend}
+        except Exception as e:
+            # yfinance often throws json.decoder.JSONDecodeError inside pandas
+            log.debug(f"Failed to compute technicals for {ticker}. Error: {e}")
+            return {}
+
+
+class AIAnalyst:
+    """Google Gemini orchestrator to generate broker briefs."""
+    SYSTEM_INSTRUCTION = """You are a professional Wall Street equity analyst and personal portfolio manager
 with 20+ years of experience across NYSE, NASDAQ, and international markets.
 
 CONTEXT
@@ -100,365 +378,13 @@ SIGNAL EMOJI LEGEND
 ⛔ AVOID   — strong negative catalyst, reassess thesis
 ⏳ PENDING — open limit/stop order; assess vs. key levels"""
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
-
-
-REQUIRED_ENV = [
-    "TELEGRAM_TOKEN",
-    "TELEGRAM_CHAT_ID",
-    "TRADING212_API_KEY",
-    "TRADING212_API_SECRET",
-    "GEMINI_API_KEY",
-]
-
-for env_name in REQUIRED_ENV:
-    if not os.environ.get(env_name):
-        log.error("Missing required environment variable: %s", env_name)
-        sys.exit(1)
-
-if not os.environ.get("FINNHUB_KEY"):
-    log.warning("Optional environment variable FINNHUB_KEY is missing. Live news will be disabled.")
-
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-ACTION_TYPE = os.environ.get("ACTION_TYPE", "analiz")
-NY_TZ = ZoneInfo("America/New_York")
-
-
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    system_instruction=SYSTEM_PROMPT,
-)
-
-
-def retry(fn, retries=3, backoff=2.0):
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            return fn()
-        except Exception as exc:
-            last_error = exc
-            if attempt >= retries:
-                log.error("Attempt %s/%s failed: %s. No retries left.", attempt, retries, exc)
-                raise
-            wait_seconds = backoff ** attempt
-            log.warning(
-                "Attempt %s/%s failed: %s. Retrying in %.2f seconds.",
-                attempt,
-                retries,
-                exc,
-                wait_seconds,
-            )
-            time.sleep(wait_seconds)
-    raise last_error
-
-
-def build_t212_auth_header() -> str:
-    key = os.environ["TRADING212_API_KEY"]
-    secret = os.environ["TRADING212_API_SECRET"]
-    encoded = base64.b64encode(f"{key}:{secret}".encode("utf-8")).decode("utf-8")
-    return f"Basic {encoded}"
-
-
-def normalize_ticker(raw: str) -> str:
-    return raw.split("_")[0] if "_" in raw else raw
-
-
-def safe_float(value, fallback: float = 0.0) -> float:
-    if value is None:
-        return fallback
-    try:
-        return float(value)
-    except Exception:
-        return fallback
-
-
-def safe_pnl_pct(current: float, average: float) -> float:
-    if not average:
-        return 0.0
-    return round(((current - average) / average) * 100, 2)
-
-
-def get_portfolio() -> tuple[list[dict], list[dict]]:
-    """Fetch positions and return (portfolio, raw_positions).
-
-    raw_positions contains the unprocessed API response so that
-    get_orders_from_positions() can detect locked quantities later.
-    """
-    url = "https://live.trading212.com/api/v0/equity/positions"
-    headers = {"Authorization": build_t212_auth_header()}
-
-    def _fetch():
-        response = None
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            return response
-        finally:
-            time.sleep(1)
-
-    response = retry(_fetch)
-
-    if response.status_code == 401:
-        log.error(
-            "T212 auth failed (401). Check TRADING212_API_KEY and TRADING212_API_SECRET. Must be Basic base64(key:secret)"
-        )
-        raise RuntimeError("Trading212 authentication failed (401)")
-
-    if response.status_code == 429:
-        log.warning("T212 rate limit hit (429). Exceeded 1 req/s. Backing off...")
-        raise RuntimeError("Trading212 rate limit hit (429)")
-
-    if response.status_code != 200:
-        log.error("Trading212 positions request failed with status %s", response.status_code)
-        raise RuntimeError(f"Trading212 request failed with status {response.status_code}")
-
-    payload = response.json()
-    positions = []
-
-    for item in payload:
-        instrument = item.get("instrument") or {}
-        raw_ticker = instrument.get("ticker", "UNKNOWN")
-        avg = safe_float(item.get("averagePricePaid"))
-        current = safe_float(item.get("currentPrice"))
-        qty = safe_float(item.get("quantity"))
-        wallet = item.get("walletImpact") or {}
-        pnl = safe_float(wallet.get("unrealizedProfitLoss"))
-
-        positions.append(
-            {
-                "ticker": normalize_ticker(raw_ticker),
-                "quantity": qty,
-                "averagePrice": avg,
-                "currentPrice": current,
-                "unrealizedPnL": pnl,
-                "unrealizedPnLPct": safe_pnl_pct(current, avg),
-            }
-        )
-
-    log.info("Loaded %s positions from Trading212.", len(positions))
-    return positions, payload
-
-
-def get_account_cash() -> dict:
-    """Fetch account cash summary (free, blocked, total, etc.)."""
-    url = "https://live.trading212.com/api/v0/equity/account/cash"
-    headers = {"Authorization": build_t212_auth_header()}
-
-    def _fetch():
-        response = None
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            return response
-        finally:
-            time.sleep(1)
-
-    response = retry(_fetch)
-
-    if response.status_code != 200:
-        log.warning("Trading212 account/cash request failed with status %s", response.status_code)
-        return {}
-
-    data = response.json()
-    log.info("Account cash: free=%.2f, blocked=%.2f, total=%.2f",
-             safe_float(data.get("free")), safe_float(data.get("blocked")),
-             safe_float(data.get("total")))
-    return data
-
-
-def get_orders_from_positions(raw_positions: list[dict]) -> list[dict]:
-    """Infer pending SELL orders from positions where quantity is locked.
-
-    When quantityAvailableForTrading < quantity, the locked portion
-    indicates an active sell limit/stop order on that stock.
-    """
-    orders = []
-    for item in raw_positions:
-        instrument = item.get("instrument") or {}
-        raw_ticker = instrument.get("ticker", "UNKNOWN")
-        qty = safe_float(item.get("quantity"))
-        available = safe_float(item.get("quantityAvailableForTrading"))
-        locked = round(qty - available, 8)
-
-        if locked > 0.0001:
-            orders.append(
-                {
-                    "ticker": normalize_ticker(raw_ticker),
-                    "type": "LIMIT (inferred)",
-                    "action": "SELL",
-                    "quantity": locked,
-                    "limitPrice": None,
-                    "stopPrice": None,
-                    "status": "PENDING (locked)",
-                    "note": f"Full qty={qty}, available={available}, locked={locked}",
-                }
-            )
-            log.info(
-                "Inferred pending sell order: %s locked=%.4f / total=%.4f",
-                normalize_ticker(raw_ticker), locked, qty,
-            )
-
-    return orders
-
-
-def get_orders(raw_positions=None) -> list[dict]:
-    """Fetch pending orders from Trading212.
-
-    Strategy:
-    1. Try the /equity/orders endpoint first (direct API).
-    2. If 403 (insufficient permissions), fall back to inferring
-       pending sell orders from locked position quantities and
-       reporting blocked cash for pending buy orders.
-    """
-    url = "https://live.trading212.com/api/v0/equity/orders"
-    headers = {"Authorization": build_t212_auth_header()}
-
-    def _fetch():
-        response = None
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            return response
-        finally:
-            time.sleep(1)
-
-    response = retry(_fetch)
-
-    if response.status_code == 401:
-        log.error(
-            "T212 auth failed (401) for orders. Check TRADING212_API_KEY and TRADING212_API_SECRET."
-        )
-        raise RuntimeError("Trading212 authentication failed (401)")
-
-    if response.status_code == 429:
-        log.warning("T212 rate limit hit (429) for orders. Backed off...")
-        raise RuntimeError("Trading212 rate limit hit (429)")
-
-    # ── Direct API succeeded ──
-    if response.status_code == 200:
-        payload = response.json()
-        orders = []
-        for item in payload:
-            if item.get("status") in ["FILLED", "CANCELLED"]:
-                continue
-            orders.append(
-                {
-                    "ticker": normalize_ticker(item.get("ticker", "UNKNOWN")),
-                    "type": item.get("type"),
-                    "action": item.get("side") or item.get("action"),
-                    "quantity": safe_float(item.get("quantity")),
-                    "limitPrice": safe_float(item.get("limitPrice")),
-                    "stopPrice": safe_float(item.get("stopPrice")),
-                    "status": item.get("status"),
-                }
-            )
-        log.info("Loaded %s pending orders from Trading212 (direct API).", len(orders))
-        return orders
-
-    # ── Fallback: infer from positions + account cash ──
-    log.warning(
-        "Trading212 /equity/orders returned %s. "
-        "Falling back to position-lock inference for pending orders.",
-        response.status_code,
-    )
-
-    orders = []
-
-    # Infer sell orders from locked positions
-    if raw_positions:
-        orders.extend(get_orders_from_positions(raw_positions))
-
-    # Get account cash to report blocked amount (pending buy orders)
-    cash = get_account_cash()
-    blocked = safe_float(cash.get("blocked"))
-    if blocked > 0:
-        orders.append(
-            {
-                "ticker": "CASH_RESERVED",
-                "type": "BUY LIMIT (inferred)",
-                "action": "BUY",
-                "quantity": None,
-                "limitPrice": None,
-                "stopPrice": None,
-                "status": "PENDING",
-                "blockedCash": blocked,
-                "note": f"€{blocked:.2f} reserved for pending buy limit orders",
-            }
-        )
-        log.info("Detected €%.2f blocked cash for pending buy orders.", blocked)
-
-    log.info(
-        "Inferred %s pending order entries from position locks + blocked cash.",
-        len(orders),
-    )
-    return orders
-
-
-def get_market_news() -> str:
-    finnhub_key = os.environ.get("FINNHUB_KEY")
-    if not finnhub_key:
-        return "No live news available. Perform general market analysis only."
-
-    url = "https://finnhub.io/api/v1/news"
-
-    def _fetch():
-        return requests.get(
-            url,
-            params={"category": "general", "token": finnhub_key},
-            timeout=10,
-        )
-
-    response = retry(_fetch)
-    response.raise_for_status()
-
-    headlines = []
-    for item in response.json():
-        headline = item.get("headline", "").strip()
-        if not headline:
-            continue
-        headlines.append(f"- {headline}")
-        if len(headlines) == 15:
-            break
-
-    log.info("Collected %s market headlines from Finnhub.", len(headlines))
-    return "\n".join(headlines)
-
-
-def get_technicals(ticker: str) -> dict:
-    try:
-        hist = yf.Ticker(ticker).history(period="3mo")
-        if hist.empty:
-            log.warning("No yfinance history returned for %s", ticker)
-            return {}
-
-        support_series = hist["Low"].rolling(20).min().dropna()
-        resistance_series = hist["High"].rolling(20).max().dropna()
-
-        support = round(float(support_series.iloc[-1]), 2) if not support_series.empty else None
-        resistance = round(float(resistance_series.iloc[-1]), 2) if not resistance_series.empty else None
-
-        volume_series = hist["Volume"].dropna()
-        if volume_series.empty:
-            vol_trend = "normal"
-        else:
-            avg_vol = volume_series.mean()
-            last_vol = volume_series.iloc[-1]
-            vol_trend = "declining" if last_vol < avg_vol * 0.7 else "normal"
-
-        return {"support": support, "resistance": resistance, "volume_trend": vol_trend}
-    except Exception as exc:
-        log.warning("Failed to compute technicals for %s: %s", ticker, exc)
-        return {}
-
-
-def build_user_prompt(portfolio: list, orders: list, news: str, technicals: dict) -> str:
-    return f"""DATE: {date.today().strftime("%B %d, %Y")}
+    def __init__(self, api_key: str):
+        self.client = genai.Client(api_key=api_key)
+        # Using 2.5-flash as the older 1.5 model is deprecated and returns 404.
+        self.model_name = "gemini-2.5-flash"
+
+    def analyze(self, portfolio: List, orders: List, news: str, technicals: Dict) -> str:
+        prompt = f"""DATE: {date.today().strftime("%B %d, %Y")}
 
 PORTFOLIO_DATA:
 {json.dumps(portfolio, indent=2)}
@@ -474,126 +400,124 @@ MARKET_NEWS:
 
 Generate the daily broker brief now."""
 
+        def _generate():
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=self.SYSTEM_INSTRUCTION,
+                )
+            )
+            return response
 
-def get_analysis(portfolio: list, orders: list, news: str, technicals: dict) -> str:
-    def _generate():
-        return model.generate_content(build_user_prompt(portfolio, orders, news, technicals))
-
-    response = retry(_generate)
-    text = (getattr(response, "text", "") or "").strip()
-    if not text:
-        return "⚠️ Gemini returned an empty response. Markets may be unusually quiet today."
-
-    log.info("Gemini analysis generated (%s chars).", len(text))
-    return text
-
-
-def send_telegram(text: str, parse_mode: str = "Markdown") -> None:
-    suffix = "\n\n_[truncated]_"
-    max_len = 4000
-    if len(text) > max_len:
-        text = text[: max_len - len(suffix)] + suffix
-
-    body = {"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode}
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-    def _post(current_body):
-        def _send():
-            return requests.post(url, json=current_body, timeout=10)
-
-        return retry(_send)
-
-    response = _post(body)
-    lower_body = (response.text or "").lower()
-
-    if response.status_code == 400 and (
-        "parse" in lower_body or "can't parse entities" in lower_body
-    ):
-        log.warning("Telegram parse_mode error, retrying without parse_mode: %s", response.text)
-        body_no_parse = {"chat_id": CHAT_ID, "text": text}
-        response = requests.post(url, json=body_no_parse, timeout=10)
-        if response.status_code >= 400:
-            log.error("Telegram fallback send failed with status %s: %s", response.status_code, response.text)
-
-    response.raise_for_status()
-    log.info("Telegram message sent (%s chars).", len(text))
+        try:
+            res = retry(_generate)
+            text = getattr(res, "text", "").strip()
+            if not text:
+                return "⚠️ Gemini returned an empty response. Markets may be unusually quiet."
+            log.info(f"AI analysis generated ({len(text)} chars).")
+            return text
+        except Exception as e:
+            log.error(f"AI generation failed: {e}")
+            raise
 
 
-def send_telegram_chunked_json(data: list) -> None:
-    json_str = json.dumps(data, indent=2, ensure_ascii=False)
-    max_chunk = 3700
-    chunks = []
-    current_chunk = ""
-    for line in json_str.splitlines(keepends=True):
-        if len(current_chunk) + len(line) <= max_chunk:
-            current_chunk += line
-            continue
+class TelegramNotifier:
+    """Sends broadcast and JSON payloads via Telegram Bot API."""
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+
+    def send_text(self, text: str, parse_mode: str = "Markdown") -> None:
+        max_len = 4000
+        suffix = "\n\n_[truncated]_"
+        if len(text) > max_len:
+            text = text[:max_len - len(suffix)] + suffix
+
+        def _post(body):
+            def _send():
+                return requests.post(self.base_url, json=body, timeout=10)
+            return retry(_send)
+
+        body = {"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
+        res = _post(body)
+        
+        # Fallback if markdown parsing fails
+        if res.status_code == 400 and ("parse" in res.text.lower() or "entities" in res.text.lower()):
+            log.warning("Markdown parse error. Sending plain text.")
+            del body["parse_mode"]
+            res = requests.post(self.base_url, json=body, timeout=10)
+        
+        res.raise_for_status()
+        log.info(f"Telegram text sent ({len(text)} chars).")
+
+    def send_json(self, data: Any) -> None:
+        json_str = json.dumps(data, indent=2, ensure_ascii=False)
+        max_chunk = 3700
+        chunks = []
+        current_chunk = ""
+        for line in json_str.splitlines(keepends=True):
+            if len(current_chunk) + len(line) <= max_chunk:
+                current_chunk += line
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = line
         if current_chunk:
             chunks.append(current_chunk)
-        if len(line) <= max_chunk:
-            current_chunk = line
-            continue
-        for i in range(0, len(line), max_chunk):
-            chunks.append(line[i : i + max_chunk])
-        current_chunk = ""
-    if current_chunk:
-        chunks.append(current_chunk)
-    if not chunks:
-        chunks = [""]
+        if not chunks:
+            chunks = ["{}"]
 
-    for chunk in chunks:
-        send_telegram(f"```json\n{chunk}\n```")
-        time.sleep(1)
-
-    log.info("Sent %s JSON chunk(s) to Telegram.", len(chunks))
+        for c in chunks:
+            self.send_text(f"```json\n{c}\n```")
+            time.sleep(1)
+        log.info(f"Sent JSON in {len(chunks)} chunks.")
 
 
-def main():
-    log.info("Starting AI Broker Bot — action=%s", ACTION_TYPE)
+class AIBrokerBot:
+    """Main orchestration application."""
+    def __init__(self):
+        self.cfg = Config()
+        self.cfg.validate()
+        
+        self.t212 = Trading212Client(self.cfg.t212_key, self.cfg.t212_secret)
+        self.market = MarketDataClient(self.cfg.finnhub_key)
+        self.ai = AIAnalyst(self.cfg.gemini_key)
+        self.notifier = TelegramNotifier(self.cfg.telegram_token, self.cfg.telegram_chat_id)
 
-    try:
-        portfolio, raw_positions = get_portfolio()
-        orders = get_orders(raw_positions=raw_positions)
-    except Exception as e:
-        send_telegram(f"⚠️ *Trading212 fetch failed*\n`{e}`")
-        return
+    def run(self):
+        log.info(f"Starting AI Broker v2 — mode: {self.cfg.action_type}")
+        try:
+            portfolio, raw = self.t212.get_portfolio()
+            orders = self.t212.get_orders(raw)
+        except Exception as e:
+            self.notifier.send_text(f"⚠️ *Trading212 fetch failed*\n`{e}`")
+            return
 
-    if not portfolio and not orders:
-        send_telegram("⚠️ No open positions or pending orders found.")
-        return
+        if not portfolio and not orders:
+            self.notifier.send_text("⚠️ No open positions or pending orders found.")
+            return
 
-    if ACTION_TYPE == "portfoy_json":
-        combined_data = {"positions": portfolio, "orders": orders}
-        send_telegram_chunked_json(combined_data)
-        return
+        if self.cfg.action_type == "portfoy_json":
+            self.notifier.send_json({"positions": portfolio, "orders": orders})
+            return
 
-    try:
-        news = get_market_news()
-    except Exception as e:
-        log.warning("News fetch failed: %s", e)
-        news = "News unavailable today."
+        # Gather context
+        news = self.market.get_news()
+        technicals = {}
+        
+        # Consolidate tickers for technicals
+        tickers = {p["ticker"] for p in portfolio} | {o["ticker"] for o in orders}
+        for ticker in tickers:
+            technicals[ticker] = self.market.get_technicals(ticker)
 
-    technicals = {}
-    for pos in portfolio:
-        result = get_technicals(pos["ticker"])
-        if result:
-            technicals[pos["ticker"]] = result
-
-    for order in orders:
-        if order["ticker"] not in technicals:
-            result = get_technicals(order["ticker"])
-            if result:
-                technicals[order["ticker"]] = result
-
-    try:
-        analysis = get_analysis(portfolio, orders, news, technicals)
-    except Exception as e:
-        send_telegram(f"⚠️ *Gemini analysis failed*\n`{e}`")
-        return
-
-    send_telegram(analysis)
-    log.info("Bot run complete.")
-
+        # Analyze and broadcast
+        try:
+            analysis = self.ai.analyze(portfolio, orders, news, technicals)
+            self.notifier.send_text(analysis)
+        except Exception as e:
+            self.notifier.send_text(f"⚠️ *Gemini analysis failed*\n`{e}`")
 
 if __name__ == "__main__":
-    main()
+    AIBrokerBot().run()
