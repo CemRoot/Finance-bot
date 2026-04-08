@@ -15,16 +15,19 @@ SYSTEM_PROMPT = """You are a professional Wall Street equity analyst and persona
 with 20+ years of experience across NYSE, NASDAQ, and international markets.
 
 CONTEXT
-You will receive two data inputs at runtime:
-  [1] PORTFOLIO_DATA — JSON array: ticker, quantity, averagePrice,
+You will receive three data inputs at runtime:
+  [1] PORTFOLIO_DATA   — JSON array: ticker, quantity, averagePrice,
       currentPrice, unrealizedPnL, unrealizedPnLPct
-  [2] MARKET_NEWS    — Today's top US equity headlines
+  [2] MARKET_NEWS      — Today's top US equity headlines
+  [3] PENDING_ORDERS   — JSON array: ticker, type, action, quantity,
+      limitPrice, stopPrice, status
 
 YOUR TASK
 1. Cross-reference each holding against today's news
 2. Identify catalysts (positive/negative) for those tickers
 3. Provide short-term price outlook with key levels
 4. Issue clear signals: HOLD / WATCH / TRIM / AVOID
+5. Review PENDING_ORDERS and comment on their validity based on key technical levels
 
 RULES
 R1 NEWS-PORTFOLIO LINKAGE
@@ -77,10 +80,11 @@ R8 HALLUCINATION GUARD
    Mark them clean.
 
 SIGNAL EMOJI LEGEND
-🟢 HOLD  — healthy, no action needed
-🟡 WATCH — monitor closely, move incoming
-🔴 TRIM  — reduce position size
-⛔ AVOID — strong negative catalyst, reassess thesis"""
+🟢 HOLD    — healthy, no action needed
+🟡 WATCH   — monitor closely, move incoming
+🔴 TRIM    — reduce position size
+⛔ AVOID   — strong negative catalyst, reassess thesis
+⏳ PENDING — open limit/stop order; assess vs. key levels"""
 
 
 logging.basicConfig(
@@ -224,6 +228,56 @@ def get_portfolio() -> list[dict]:
     return positions
 
 
+def get_orders() -> list[dict]:
+    url = "https://live.trading212.com/api/v0/equity/orders"
+    headers = {"Authorization": build_t212_auth_header()}
+
+    def _fetch():
+        response = None
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            return response
+        finally:
+            time.sleep(1)
+
+    response = retry(_fetch)
+
+    if response.status_code == 401:
+        log.error(
+            "T212 auth failed (401) for orders. Check TRADING212_API_KEY and TRADING212_API_SECRET."
+        )
+        raise RuntimeError("Trading212 authentication failed (401)")
+
+    if response.status_code == 429:
+        log.warning("T212 rate limit hit (429) for orders. Backed off...")
+        raise RuntimeError("Trading212 rate limit hit (429)")
+
+    if response.status_code != 200:
+        log.warning("Trading212 orders request failed with status %s", response.status_code)
+        return []
+
+    payload = response.json()
+    orders = []
+
+    for item in payload:
+        if item.get("status") in ["FILLED", "CANCELLED"]:
+            continue
+        orders.append(
+            {
+                "ticker": normalize_ticker(item.get("ticker", "UNKNOWN")),
+                "type": item.get("type"),
+                "action": item.get("action"),
+                "quantity": safe_float(item.get("quantity")),
+                "limitPrice": safe_float(item.get("limitPrice")),
+                "stopPrice": safe_float(item.get("stopPrice")),
+                "status": item.get("status"),
+            }
+        )
+
+    log.info("Loaded %s pending orders from Trading212.", len(orders))
+    return orders
+
+
 def get_market_news() -> str:
     finnhub_key = os.environ.get("FINNHUB_KEY")
     if not finnhub_key:
@@ -281,11 +335,14 @@ def get_technicals(ticker: str) -> dict:
         return {}
 
 
-def build_user_prompt(portfolio: list, news: str, technicals: dict) -> str:
+def build_user_prompt(portfolio: list, orders: list, news: str, technicals: dict) -> str:
     return f"""DATE: {date.today().strftime("%B %d, %Y")}
 
 PORTFOLIO_DATA:
 {json.dumps(portfolio, indent=2)}
+
+PENDING_ORDERS:
+{json.dumps(orders, indent=2)}
 
 TECHNICALS:
 {json.dumps(technicals, indent=2)}
@@ -296,9 +353,9 @@ MARKET_NEWS:
 Generate the daily broker brief now."""
 
 
-def get_analysis(portfolio: list, news: str, technicals: dict) -> str:
+def get_analysis(portfolio: list, orders: list, news: str, technicals: dict) -> str:
     def _generate():
-        return model.generate_content(build_user_prompt(portfolio, news, technicals))
+        return model.generate_content(build_user_prompt(portfolio, orders, news, technicals))
 
     response = retry(_generate)
     text = (getattr(response, "text", "") or "").strip()
@@ -374,16 +431,18 @@ def main():
 
     try:
         portfolio = get_portfolio()
+        orders = get_orders()
     except Exception as e:
         send_telegram(f"⚠️ *Trading212 fetch failed*\n`{e}`")
         return
 
-    if not portfolio:
-        send_telegram("⚠️ Portfolio is empty or no open positions found.")
+    if not portfolio and not orders:
+        send_telegram("⚠️ No open positions or pending orders found.")
         return
 
     if ACTION_TYPE == "portfoy_json":
-        send_telegram_chunked_json(portfolio)
+        combined_data = {"positions": portfolio, "orders": orders}
+        send_telegram_chunked_json(combined_data)
         return
 
     try:
@@ -398,8 +457,14 @@ def main():
         if result:
             technicals[pos["ticker"]] = result
 
+    for order in orders:
+        if order["ticker"] not in technicals:
+            result = get_technicals(order["ticker"])
+            if result:
+                technicals[order["ticker"]] = result
+
     try:
-        analysis = get_analysis(portfolio, news, technicals)
+        analysis = get_analysis(portfolio, orders, news, technicals)
     except Exception as e:
         send_telegram(f"⚠️ *Gemini analysis failed*\n`{e}`")
         return
