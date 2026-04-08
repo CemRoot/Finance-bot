@@ -1,3 +1,4 @@
 requests>=2.31.0
 google-genai>=0.3.0
 yfinance>=0.2.40
+groq>=0.5.0

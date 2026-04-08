@@ -12,6 +12,7 @@ import requests
 import yfinance as yf
 from google import genai
 from google.genai import types
+import groq
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +30,9 @@ class Config:
         self.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
         self.t212_key = os.environ.get("TRADING212_API_KEY")
         self.t212_secret = os.environ.get("TRADING212_API_SECRET")
+        self.llm_provider = os.environ.get("LLM_PROVIDER", "gemini").lower()
         self.gemini_key = os.environ.get("GEMINI_API_KEY")
+        self.groq_key = os.environ.get("GROQ_API_KEY")
         self.finnhub_key = os.environ.get("FINNHUB_KEY")
         self.action_type = os.environ.get("ACTION_TYPE", "analiz")
         self.timezone = ZoneInfo("America/New_York")
@@ -40,8 +43,14 @@ class Config:
             "TELEGRAM_CHAT_ID": self.telegram_chat_id,
             "TRADING212_API_KEY": self.t212_key,
             "TRADING212_API_SECRET": self.t212_secret,
-            "GEMINI_API_KEY": self.gemini_key,
         }
+        if self.llm_provider == "gemini" and not self.gemini_key:
+            log.error("Missing required environment variable: GEMINI_API_KEY for Gemini provider.")
+            sys.exit(1)
+        if self.llm_provider == "groq" and not self.groq_key:
+            log.error("Missing required environment variable: GROQ_API_KEY for Groq provider.")
+            sys.exit(1)
+        
         for name, val in required.items():
             if not val:
                 log.error(f"Missing required environment variable: {name}")
@@ -378,10 +387,14 @@ SIGNAL EMOJI LEGEND
 ⛔ AVOID   — strong negative catalyst, reassess thesis
 ⏳ PENDING — open limit/stop order; assess vs. key levels"""
 
-    def __init__(self, api_key: str):
-        self.client = genai.Client(api_key=api_key)
-        # Using 2.5-flash as the older 1.5 model is deprecated and returns 404.
-        self.model_name = "gemini-2.5-flash"
+    def __init__(self, provider: str, gemini_key: str, groq_key: str):
+        self.provider = provider
+        if self.provider == "groq":
+            self.client = groq.Groq(api_key=groq_key)
+            self.model_name = "llama-3.3-70b-versatile"
+        else:
+            self.client = genai.Client(api_key=gemini_key)
+            self.model_name = "gemini-2.5-flash"
 
     def analyze(self, portfolio: List, orders: List, news: str, technicals: Dict) -> str:
         prompt = f"""DATE: {date.today().strftime("%B %d, %Y")}
@@ -401,24 +414,40 @@ MARKET_NEWS:
 Generate the daily broker brief now."""
 
         def _generate():
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=self.SYSTEM_INSTRUCTION,
+            if self.provider == "groq":
+                messages = [
+                    {"role": "system", "content": self.SYSTEM_INSTRUCTION},
+                    {"role": "user", "content": prompt}
+                ]
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.3,
                 )
-            )
-            return response
+                return response
+            else:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                    )
+                )
+                return response
 
         try:
             res = retry(_generate)
-            text = getattr(res, "text", "").strip()
+            if self.provider == "groq":
+                text = res.choices[0].message.content.strip()
+            else:
+                text = getattr(res, "text", "").strip()
+                
             if not text:
-                return "⚠️ Gemini returned an empty response. Markets may be unusually quiet."
-            log.info(f"AI analysis generated ({len(text)} chars).")
+                return "⚠️ AI returned an empty response. Markets may be unusually quiet."
+            log.info(f"AI analysis generated ({len(text)} chars) using {self.provider.upper()}.")
             return text
         except Exception as e:
-            log.error(f"AI generation failed: {e}")
+            log.error(f"AI generation failed ({self.provider}): {e}")
             raise
 
 
@@ -483,7 +512,7 @@ class AIBrokerBot:
         
         self.t212 = Trading212Client(self.cfg.t212_key, self.cfg.t212_secret)
         self.market = MarketDataClient(self.cfg.finnhub_key)
-        self.ai = AIAnalyst(self.cfg.gemini_key)
+        self.ai = AIAnalyst(self.cfg.llm_provider, self.cfg.gemini_key, self.cfg.groq_key)
         self.notifier = TelegramNotifier(self.cfg.telegram_token, self.cfg.telegram_chat_id)
 
     def run(self):
