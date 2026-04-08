@@ -1,0 +1,96 @@
+# ========================
+# 🔒 Environment & Secrets
+# ========================
+.env
+.env.local
+.env.production
+.env.staging
+.env.*.local
+*.secret
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# API keys / credentials that might be saved as files
+credentials.json
+service-account*.json
+token.json
+secrets.json
+config.local.*
+
+# ========================
+# 🐍 Python
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.conda/
+
+# ========================
+# 📦 IDE & Editor
+# ========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ========================
+# 📋 Logs & Databases
+# ========================
+*.log
+*.sqlite3
+*.db
+*.sqlite
+
+# ========================
+# 🧪 Testing & Coverage
+# ========================
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+
+# ========================
+# 📁 OS Files
+# ========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# ========================
+# 🔧 Misc
+# ========================
+*.bak
+*.tmp
+*.temp
+*.orig
