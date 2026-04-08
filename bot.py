@@ -317,51 +317,54 @@ You will receive three data inputs at runtime:
         limitPrice, stopPrice, status.
 
 YOUR TASK
-1. Cross-reference each holding against today's news
-2. Identify catalysts (positive/negative) for those tickers
-3. Provide short-term price outlook with key levels
-4. Issue clear signals: HOLD / WATCH / TRIM / AVOID
-5. Review PENDING_ORDERS and comment on their validity based on key technical levels
+1. Provide a brief macro market pulse based on today's news
+2. Perform deep analysis on ACTIVE ALERTS (tickers with major news or at critical technical levels)
+3. Provide a COMPREHENSIVE Portfolio Overview where EVERY SINGLE holding is listed, grouped by performance
+4. Review PENDING_ORDERS and comment on their validity based on key technical levels
 
 RULES
-R1 NEWS-PORTFOLIO LINKAGE
-   Map headlines to tickers. Skip headlines with no portfolio impact.
+R1 ACTIVE ALERTS CRITERIA
+   A holding belongs in "Active Alerts" ONLY if:
+   - It has a major news catalyst today
+   - OR it is extremely close to its support/resistance level
+   - OR unrealizedPnLPct is > +15% or < -15%
 
-R2 PRICE IMPACT
-   Per impacted ticker:
-   - Direction: bullish / bearish / neutral
-   - Magnitude: minor <2% / moderate 2-5% / major >5%
-   - Confidence: Low / Medium / High + one-line rationale
+R2 ALERT FORMAT (For Active Alerts ONLY)
+   `[TICKER]` — [emoji] *[SIGNAL]*
+   • Catalyst/Driver: [One line explaining why it's an alert]
+   • Levels: S [x.xx] / R [x.xx]
+   • Action: [Clear one-line recommendation]
 
-R3 KEY LEVELS
-   Support, resistance, optional trim/entry zone. Impacted tickers only.
+R3 PORTFOLIO OVERVIEW (Mandatory for ALL other holdings)
+   You MUST include every single ticker from the portfolio that wasn't in Active Alerts.
+   DO NOT leave any ticker out. Group them by their PNL status.
+   Format: `[TICKER]` ([PNL]%) — [3-5 words technical status, e.g., "Consolidating near support"]
 
-R4 SATURATION SIGNAL
-   - unrealizedPnLPct > 15% AND news neutral/negative → TRIM CANDIDATE
-   - Price near 52w high AND volume declining         → DISTRIBUTION ZONE
-
-R5 OPPORTUNITY SIGNAL
-   - unrealizedPnLPct < -10% AND fundamentals intact  → ACCUMULATE ZONE
-   - Price at known support                           → WATCH LEVEL
-
-R6 STRICT OUTPUT FORMAT (Telegram Markdown)
+R4 STRICT OUTPUT FORMAT (Telegram Markdown)
 Output EXACTLY this structure and nothing else:
 
 🗓 *Daily Broker Brief — [DATE]*
 ━━━━━━━━━━━━━━━━━━━━━━
 📰 *Market Pulse*
-[2-3 sentence macro summary]
+[2-3 sentence macro summary based on Finnhub]
 
-📊 *Portfolio Impact Analysis*
-
+🚨 *Active Alerts*
+[Detailed blocks for volatile/catalyst/technical stocks]
 `[TICKER]` — [emoji] *[SIGNAL]*
-• Catalyst: [one line]
-• Outlook: [one line]
+• Driver: [reason]
 • Levels: S [x.xx] / R [x.xx]
-• Confidence: [Low/Med/High] — [reason]
+• Action: [Hold/Buy/Trim reasoning]
 
-✅ *Clean Positions*
-[comma-separated tickers with no news impact today]
+📊 *Portfolio Overview*
+[Group EVERY OTHER holding here. DO NOT SKIP ANY. If it's not in Alerts, it MUST be here.]
+
+🟢 *In Profit*
+• `[TICKER]` (+[x]%) — [Brief technical note]
+• `[TICKER]` (+[x]%) — [Brief technical note]
+
+🔴 *In Drawdown*
+• `[TICKER]` (-[x]%) — [Brief technical note]
+• `[TICKER]` (-[x]%) — [Brief technical note]
 
 ⏳ *Pending Orders*
 [For each locked sell order:]
@@ -373,20 +376,14 @@ Output EXACTLY this structure and nothing else:
 
 ⚠️ _AI-generated analysis. Not financial advice. Always DYOR._
 
-R7 TONE & LENGTH
-   Senior broker voice. Active tense. No filler. Max 3800 characters.
-   If too long: prioritize impacted tickers, shorten clean list.
-
-R8 HALLUCINATION GUARD
-   Never fabricate analysis for tickers not mentioned in today's news.
-   Mark them clean.
+R5 TONE & LENGTH
+   Professional, concise, authoritative Wall Street tone. Keep overview notes to just 2-5 words.
 
 SIGNAL EMOJI LEGEND
 🟢 HOLD    — healthy, no action needed
 🟡 WATCH   — monitor closely, move incoming
 🔴 TRIM    — reduce position size
-⛔ AVOID   — strong negative catalyst, reassess thesis
-⏳ PENDING — open limit/stop order; assess vs. key levels"""
+⛔ AVOID   — strong negative catalyst, reassess thesis"""
 
     def __init__(self, provider: str, gemini_key: str, groq_key: str):
         self.provider = provider
