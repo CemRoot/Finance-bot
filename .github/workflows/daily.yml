@@ -35,6 +35,7 @@ jobs:
           echo "::add-mask::${{ secrets.TRADING212_API_KEY }}"
           echo "::add-mask::${{ secrets.TRADING212_API_SECRET }}"
           echo "::add-mask::${{ secrets.GEMINI_API_KEY }}"
+          echo "::add-mask::${{ secrets.GROQ_API_KEY }}"
           echo "::add-mask::${{ secrets.FINNHUB_KEY }}"
       - name: Run bot
         env:
@@ -43,6 +44,8 @@ jobs:
           TRADING212_API_KEY:    ${{ secrets.TRADING212_API_KEY }}
           TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
           GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
+          LLM_PROVIDER:          ${{ secrets.LLM_PROVIDER || 'groq' }}
           FINNHUB_KEY:           ${{ secrets.FINNHUB_KEY }}
           ACTION_TYPE:           ${{ github.event.inputs.action_type || 'analiz' }}
         run: python bot.py
